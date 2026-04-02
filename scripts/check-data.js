@@ -3,7 +3,7 @@ require('dotenv').config();
 
 async function run() {
     const connection = await mysql.createConnection({
-        host: 'localhost',
+        host: '127.0.0.1',
         user: 'root',
         password: '',
         database: 'personal_cloud'

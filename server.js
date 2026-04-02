@@ -8,6 +8,7 @@ const cors = require('cors');
 const db = require('./db');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
@@ -21,10 +22,28 @@ const APACHE_BIN = `${XAMPP_PATH}\\apache\\bin\\httpd.exe`;
 const MYSQL_BIN = `${XAMPP_PATH}\\mysql\\bin\\mysqld.exe`;
 
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret';
+const ENCRYPTION_KEY = crypto.scryptSync(JWT_SECRET, 'salt', 32); // 256-bit key
+const IV_LENGTH = 16; 
+
 const UPLOAD_DIR = path.resolve('cloud');
 const TEMP_DIR = path.join(UPLOAD_DIR, 'temp');
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
+
+// Encryption Helpers
+const encryptBuffer = (buffer) => {
+    const iv = crypto.randomBytes(IV_LENGTH);
+    const cipher = crypto.createCipheriv('aes-256-cbc', ENCRYPTION_KEY, iv);
+    const encrypted = Buffer.concat([cipher.update(buffer), cipher.final()]);
+    return Buffer.concat([iv, encrypted]);
+};
+
+const decryptBuffer = (buffer) => {
+    const iv = buffer.slice(0, IV_LENGTH);
+    const encryptedData = buffer.slice(IV_LENGTH);
+    const decipher = crypto.createDecipheriv('aes-256-cbc', ENCRYPTION_KEY, iv);
+    return Buffer.concat([decipher.update(encryptedData), decipher.final()]);
+};
 
 // Helper to build physical path from DB hierarchy
 const getFolderPathString = async (folderId) => {
@@ -33,6 +52,17 @@ const getFolderPathString = async (folderId) => {
     if (!folder) return '';
     const parentPath = await getFolderPathString(folder.parent_id);
     return path.join(parentPath, folder.name);
+};
+
+// Helper to get all subfolder IDs recursively
+const getDescendantFolderIds = async (folderId) => {
+    let ids = [folderId];
+    const subfolders = await db.query('SELECT id FROM folders WHERE parent_id = ?', [folderId]);
+    for (const f of subfolders.rows) {
+        const subIds = await getDescendantFolderIds(f.id);
+        ids = ids.concat(subIds);
+    }
+    return ids;
 };
 
 // Middleware for JWT Authentication
@@ -141,12 +171,13 @@ const upload = multer({ storage: storage });
 // AUTH ROUTES
 app.post('/register', async (req, res) => {
     try {
-        const { username, email, password } = req.body;
+        const { username, email, password, first_name, last_name } = req.body;
         if (!username || !email || !password) return res.status(400).json({ error: 'Missing fields' });
 
         const userId = uuidv4();
         const hash = await bcrypt.hash(password, 10);
-        await db.query('INSERT INTO users (id, username, email, password_hash) VALUES (?,?,?,?)', [userId, username, email, hash]);
+        await db.query('INSERT INTO users (id, username, email, password_hash, first_name, last_name) VALUES (?,?,?,?,?,?)', 
+            [userId, username, email, hash, first_name || null, last_name || null]);
         
         // Auto-create user cloud folders
         const activeDir = path.join(UPLOAD_DIR, userId, 'active');
@@ -172,8 +203,11 @@ app.post('/login', async (req, res) => {
         if (!match) return res.status(401).json({ error: 'Invalid credentials' });
 
         const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
-        res.json({ token, username: user.username, role: user.role });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+        res.json({ token, id: user.id, username: user.username, role: user.role });
+    } catch (err) { 
+        console.error('LOGIN ERROR:', err);
+        res.status(500).json({ error: err.message }); 
+    }
 });
 
 app.put('/users/settings', authenticateToken, async (req, res) => {
@@ -206,10 +240,13 @@ app.post('/users/profile-picture', authenticateToken, upload.single('avatar'), a
         if (!req.file) return res.status(400).json({ error: 'No image file' });
 
         const filename = req.file.filename;
+        const userDir = path.join(UPLOAD_DIR, userId);
         const profilePath = `cloud/${userId}/${filename}`;
         const absPath = path.resolve(profilePath);
 
-        // Move from temp to user root
+        if (!fs.existsSync(userDir)) fs.mkdirSync(userDir, { recursive: true });
+
+        // No encryption for profile pictures to simplify direct display
         fs.renameSync(req.file.path, absPath);
 
         await db.query('UPDATE users SET profile_picture = ? WHERE id = ?', [profilePath, userId]);
@@ -222,17 +259,20 @@ app.post('/users/profile-picture', authenticateToken, upload.single('avatar'), a
 app.get('/users/me', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.id;
-        const [user] = (await db.query('SELECT id, username, email, role, first_name, last_name, profile_picture, created_at FROM users WHERE id = ?', [userId])).rows;
+        const userResult = await db.query('SELECT id, username, email, role, first_name, last_name, profile_picture, storage_quota, created_at FROM users WHERE id = ?', [userId]);
+        const user = userResult.rows && userResult.rows[0];
 
         if (!user) return res.status(404).json({ error: 'User not found' });
 
-        const [storage] = (await db.query('SELECT SUM(size) as total_size FROM files WHERE user_id = ? AND is_deleted = 0', [userId])).rows;
+        const storageResult = await db.query('SELECT SUM(size) as total_size FROM files WHERE user_id = ? AND is_deleted = 0', [userId]);
+        const storage = storageResult.rows && storageResult.rows[0];
 
         res.json({
             ...user,
-            storage_used: storage.total_size || 0,
-            storage_quota: 5 * 1024 * 1024 * 1024 // 5GB mock quota
+            storage_used: (storage && storage.total_size) || 0,
+            storage_quota: user.role === 'admin' ? 0 : (user.storage_quota || 1073741824)
         });
+
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -255,21 +295,142 @@ app.get('/users/search', authenticateToken, async (req, res) => {
 
 app.post('/share', authenticateToken, async (req, res) => {
     try {
-        const { item_id, item_type, target_user_id, access_level } = req.body;
-        const id = uuidv4();
-        const col = item_type === 'folder' ? 'folder_id' : 'file_id';
-        await db.query(`INSERT INTO permissions (id, ${col}, user_id, access_level) VALUES (?,?,?,?) 
-                       ON DUPLICATE KEY UPDATE access_level = VALUES(access_level)`, 
-                       [id, item_id, target_user_id, access_level || 'view']);
-        res.json({ message: 'Shared successfully' });
+        const { item_ids, item_types, target_user_ids, access_level } = req.body;
+        
+        if (!item_ids?.length || !target_user_ids?.length) {
+            return res.status(400).json({ error: 'Missing items or users' });
+        }
+
+        for (const itemId of item_ids) {
+            const type = item_types[itemId]; 
+            const col = type === 'folder' ? 'folder_id' : 'file_id';
+            
+            for (const targetId of target_user_ids) {
+                const id = uuidv4();
+                await db.query(`INSERT INTO permissions (id, ${col}, user_id, access_level) VALUES (?,?,?,?) 
+                               ON DUPLICATE KEY UPDATE access_level = VALUES(access_level)`, 
+                               [id, itemId, targetId, access_level || 'view']);
+            }
+        }
+        
+        res.json({ message: 'Shared successfully with all users' });
     } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PUBLIC LINKS
+app.post('/share/public', authenticateToken, async (req, res) => {
+    try {
+        const { item_id, type } = req.body;
+        const share_token = uuidv4().replace(/-/g, '');
+        const id = uuidv4();
+        
+        const col = type === 'folder' ? 'folder_id' : 'file_id';
+        await db.query(`INSERT INTO shared_links (id, share_token, ${col}) VALUES (?,?,?)`, [id, share_token, item_id]);
+        
+        res.json({ public_url: `http://localhost:3000/public/view/${share_token}` });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/public/view/:token', async (req, res) => {
+    try {
+        const r = await db.query('SELECT file_id, folder_id FROM shared_links WHERE share_token = ?', [req.params.token]);
+        if (!r.rows.length) return res.status(404).send('Link expired or invalid');
+        
+        const { file_id } = r.rows[0];
+        if (file_id) {
+            const fr = await db.query('SELECT storage_path, mime_type, name FROM files WHERE id = ?', [file_id]);
+            const file = fr.rows[0];
+            const encryptedData = fs.readFileSync(path.resolve(file.storage_path));
+            const decryptedData = decryptBuffer(encryptedData);
+            res.setHeader('Content-Type', file.mime_type);
+            res.setHeader('Content-Disposition', `attachment; filename="${file.name}"`);
+            res.send(decryptedData);
+        } else {
+            res.status(400).send('Folder public links not yet fully implemented');
+        }
+    } catch (e) { res.status(500).send(e.message); }
+});
+
+app.get('/public/download/:token', async (req, res) => {
+    try {
+        const r = await db.query('SELECT file_id FROM shared_links WHERE share_token = ?', [req.params.token]);
+        if (!r.rows.length) return res.status(404).send('Invalid link');
+        
+        const fr = await db.query('SELECT storage_path, name, mime_type FROM files WHERE id = ?', [r.rows[0].file_id]);
+        const file = fr.rows[0];
+        const encryptedData = fs.readFileSync(path.resolve(file.storage_path));
+        const decryptedData = decryptBuffer(encryptedData);
+        
+        res.setHeader('Content-Type', file.mime_type || 'application/octet-stream');
+        res.setHeader('Content-Disposition', `attachment; filename="${file.name}"`);
+        res.send(decryptedData);
+    } catch (e) { res.status(500).send(e.message); }
 });
 
 // ADMIN ROUTES
 app.get('/admin/users', authenticateToken, isAdmin, async (req, res) => {
     try {
-        const result = await db.query('SELECT id, username, email, role, created_at FROM users ORDER BY created_at DESC');
+        const result = await db.query(`
+            SELECT u.id, u.username, u.email, u.role, u.first_name, u.last_name, u.profile_picture, u.storage_quota, u.created_at,
+            (SELECT COUNT(*) FROM tickets WHERE user_id = u.id) as total_tickets,
+            (SELECT COUNT(*) FROM tickets WHERE user_id = u.id AND status = 'open') as active_tickets,
+            (SELECT COALESCE(SUM(size), 0) FROM files WHERE user_id = u.id AND is_deleted = 0) as storage_used
+            FROM users u 
+            ORDER BY CASE WHEN u.role = 'admin' THEN 0 ELSE 1 END ASC, u.created_at DESC
+        `);
         res.json(result.rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/admin/create-admin', authenticateToken, isAdmin, async (req, res) => {
+    try {
+        const { username, email, password, first_name, last_name } = req.body;
+        if (!username || !email || !password) return res.status(400).json({ error: 'Required fields missing' });
+
+        const [existing] = (await db.query('SELECT id FROM users WHERE email = ?', [email])).rows;
+        if (existing) return res.status(400).json({ error: 'User with this email already exists' });
+
+        const hash = await bcrypt.hash(password, 10);
+        const userId = uuidv4();
+
+        await db.query('INSERT INTO users (id, username, email, password_hash, role, first_name, last_name, storage_quota) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', 
+            [userId, username, email, hash, 'admin', first_name || null, last_name || null, 0]);
+
+        const userDir = path.join(UPLOAD_DIR, userId);
+        const activeDir = path.join(userDir, 'active');
+        const trashDir = path.join(userDir, 'trash');
+        if (!fs.existsSync(userDir)) fs.mkdirSync(userDir, { recursive: true });
+        if (!fs.existsSync(activeDir)) fs.mkdirSync(activeDir, { recursive: true });
+        if (!fs.existsSync(trashDir)) fs.mkdirSync(trashDir, { recursive: true });
+
+        res.status(201).json({ message: 'Admin created successfully', id: userId });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put('/admin/users/:id', authenticateToken, isAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { username, email, first_name, last_name, role, storage_quota, password } = req.body;
+        
+        const [targetUser] = (await db.query('SELECT role FROM users WHERE id = ?', [id])).rows;
+        if (targetUser && targetUser.role === 'admin' && role === 'user') {
+            return res.status(400).json({ error: 'Cannot demote an administrator to a standard user' });
+        }
+
+        let query = 'UPDATE users SET username=?, email=?, first_name=?, last_name=?, role=?, storage_quota=?';
+        let params = [username, email, first_name, last_name, role, storage_quota];
+
+        if (password) {
+            const hash = await bcrypt.hash(password, 10);
+            query += ', password_hash=?';
+            params.push(hash);
+        }
+
+        query += ' WHERE id=?';
+        params.push(id);
+
+        await db.query(query, params);
+        res.json({ message: 'User updated successfully' });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -278,7 +439,6 @@ app.delete('/admin/users/:id', authenticateToken, isAdmin, async (req, res) => {
         const { id } = req.params;
         if (id === req.user.id) return res.status(400).json({ error: 'Cannot delete yourself' });
         
-        // Delete user's physical cloud folder
         const userDir = path.resolve(UPLOAD_DIR, id);
         if (fs.existsSync(userDir)) fs.rmSync(userDir, { recursive: true, force: true });
         
@@ -287,7 +447,256 @@ app.delete('/admin/users/:id', authenticateToken, isAdmin, async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 1. Upload - Protected & Hierarchical
+// TICKET ROUTES
+app.post('/tickets', authenticateToken, async (req, res) => {
+    try {
+        const { subject, content } = req.body;
+        if (!subject || !content) return res.status(400).json({ error: 'Subject and content are required' });
+        
+        const ticketId = uuidv4();
+        await db.query('INSERT INTO tickets (id, user_id, subject) VALUES (?, ?, ?)', [ticketId, req.user.id, subject]);
+        
+        const messageId = uuidv4();
+        await db.query('INSERT INTO ticket_messages (id, ticket_id, sender_id, content) VALUES (?, ?, ?, ?)', 
+            [messageId, ticketId, req.user.id, content]);
+            
+        res.status(201).json({ id: ticketId, subject });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/tickets', authenticateToken, async (req, res) => {
+    try {
+        let query = 'SELECT t.*, u.username FROM tickets t JOIN users u ON t.user_id = u.id';
+        let params = [];
+        
+        if (req.user.role !== 'admin') {
+            query += ' WHERE t.user_id = ?';
+            params.push(req.user.id);
+        }
+        
+        query += ' ORDER BY t.created_at DESC';
+        const result = await db.query(query, params);
+        res.json(result.rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/tickets/:id', authenticateToken, async (req, res) => {
+    try {
+        const [ticket] = (await db.query('SELECT t.*, u.username FROM tickets t JOIN users u ON t.user_id = u.id WHERE t.id = ?', [req.params.id])).rows;
+        if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
+        
+        if (req.user.role !== 'admin' && ticket.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+        
+        const messages = await db.query(`
+            SELECT tm.*, u.username as sender_name, u.role as sender_role
+            FROM ticket_messages tm
+            JOIN users u ON tm.sender_id = u.id
+            WHERE tm.ticket_id = ?
+            ORDER BY tm.created_at ASC
+        `, [req.params.id]);
+        
+        res.json({ ...ticket, messages: messages.rows });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/tickets/:id/messages', authenticateToken, async (req, res) => {
+    try {
+        const { content } = req.body;
+        const [ticket] = (await db.query('SELECT user_id, status FROM tickets WHERE id = ?', [req.params.id])).rows;
+        if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
+        
+        if (req.user.role !== 'admin' && ticket.user_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+        if (ticket.status === 'closed') return res.status(400).json({ error: 'Ticket is closed' });
+
+        const messageId = uuidv4();
+        await db.query('INSERT INTO ticket_messages (id, ticket_id, sender_id, content) VALUES (?, ?, ?, ?)', 
+            [messageId, req.params.id, req.user.id, content]);
+            
+        res.status(201).json({ id: messageId });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put('/tickets/:id/status', authenticateToken, async (req, res) => {
+    try {
+        const { status } = req.body;
+        if (req.user.role !== 'admin') return res.status(403).json({ error: 'Only admins can change status' });
+        
+        await db.query('UPDATE tickets SET status = ? WHERE id = ?', [status, req.params.id]);
+        res.json({ message: 'Status updated' });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/groups', authenticateToken, async (req, res) => {
+    try {
+        const { name, member_ids } = req.body;
+        if (!name) return res.status(400).json({ error: 'Group name is required' });
+        
+        const groupId = uuidv4();
+        await db.query('INSERT INTO `groups` (id, name, created_by) VALUES (?, ?, ?)', [groupId, name, req.user.id]);
+        
+        await db.query('INSERT INTO group_members (id, group_id, user_id, role) VALUES (?, ?, ?, ?)', 
+            [uuidv4(), groupId, req.user.id, 'admin']);
+            
+        if (member_ids && Array.isArray(member_ids)) {
+            for (const memberId of member_ids) {
+                if (memberId !== req.user.id) {
+                    await db.query('INSERT IGNORE INTO group_members (id, group_id, user_id, role) VALUES (?, ?, ?, ?)', 
+                        [uuidv4(), groupId, memberId, 'member']);
+                }
+            }
+        }
+        
+        res.status(201).json({ id: groupId, name });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/groups', authenticateToken, async (req, res) => {
+    try {
+        const result = await db.query(`
+            SELECT g.* FROM \`groups\` g
+            JOIN group_members gm ON g.id = gm.group_id
+            WHERE gm.user_id = ?
+            ORDER BY g.created_at DESC
+        `, [req.user.id]);
+        res.json(result.rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/groups/:id/members', authenticateToken, async (req, res) => {
+    try {
+        const result = await db.query(`
+            SELECT u.id, u.username, u.email, gm.role, gm.joined_at
+            FROM users u
+            JOIN group_members gm ON u.id = gm.user_id
+            WHERE gm.group_id = ?
+        `, [req.params.id]);
+        res.json(result.rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/groups/:id/members', authenticateToken, async (req, res) => {
+    try {
+        const { user_id, role } = req.body;
+        const [adminCheck] = (await db.query('SELECT role FROM group_members WHERE group_id = ? AND user_id = ?', [req.params.id, req.user.id])).rows;
+        if (!adminCheck || adminCheck.role !== 'admin') return res.status(403).json({ error: 'Only admins can add members' });
+        
+        await db.query('INSERT IGNORE INTO group_members (id, group_id, user_id, role) VALUES (?, ?, ?, ?)', 
+            [uuidv4(), req.params.id, user_id, role || 'member']);
+        res.json({ message: 'Member added' });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// MESSAGE ROUTES
+app.post('/messages', authenticateToken, async (req, res) => {
+    try {
+        const { recipient_id, group_id, content } = req.body;
+        if (!content) return res.status(400).json({ error: 'Content is required' });
+        if (!recipient_id && !group_id) return res.status(400).json({ error: 'Recipient or Group is required' });
+        
+        const messageId = uuidv4();
+        await db.query('INSERT INTO messages (id, sender_id, recipient_id, group_id, content) VALUES (?, ?, ?, ?, ?)', 
+            [messageId, req.user.id, recipient_id || null, group_id || null, content]);
+        
+        res.status(201).json({ id: messageId, sender_id: req.user.id, content, created_at: new Date() });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/messages/chat/:targetId', authenticateToken, async (req, res) => {
+    try {
+        const result = await db.query(`
+            SELECT m.*, u.username AS sender_name FROM messages m
+            JOIN users u ON m.sender_id = u.id
+            WHERE (m.sender_id = ? AND m.recipient_id = ?)
+               OR (m.sender_id = ? AND m.recipient_id = ?)
+            ORDER BY m.created_at ASC
+        `, [req.user.id, req.params.targetId, req.params.targetId, req.user.id]);
+        res.json(result.rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/messages/group/:groupId', authenticateToken, async (req, res) => {
+    try {
+        const [memberCheck] = (await db.query('SELECT id FROM group_members WHERE group_id = ? AND user_id = ?', [req.params.groupId, req.user.id])).rows;
+        if (!memberCheck) return res.status(403).json({ error: 'Not a member of this group' });
+        
+        const result = await db.query(`
+            SELECT m.*, u.username AS sender_name FROM messages m
+            JOIN users u ON m.sender_id = u.id
+            WHERE m.group_id = ?
+            ORDER BY m.created_at ASC
+        `, [req.params.groupId]);
+        res.json(result.rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// FRIENDS ROUTES
+app.post('/friends/request', authenticateToken, async (req, res) => {
+    try {
+        const { friend_id } = req.body;
+        if (req.user.id === friend_id) return res.status(400).json({ error: 'Cannot add yourself' });
+        
+        const [existing] = (await db.query('SELECT id FROM friends WHERE (user_id = ? AND friend_id = ?) OR (user_id = ? AND friend_id = ?)', 
+            [req.user.id, friend_id, friend_id, req.user.id])).rows;
+            
+        if (existing) return res.status(400).json({ error: 'Request already exists or already friends' });
+
+        await db.query('INSERT INTO friends (id, user_id, friend_id, status) VALUES (?, ?, ?, ?)', 
+            [uuidv4(), req.user.id, friend_id, 'pending']);
+        res.json({ message: 'Request sent' });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/friends', authenticateToken, async (req, res) => {
+    try {
+        const friends = await db.query(`
+            SELECT f.id, u.id as user_id, u.username, u.email, u.profile_picture 
+            FROM friends f
+            JOIN users u ON (f.user_id = u.id OR f.friend_id = u.id)
+            WHERE (f.user_id = ? OR f.friend_id = ?) 
+              AND f.status = 'accepted'
+              AND u.id != ?
+        `, [req.user.id, req.user.id, req.user.id]);
+
+        const pending = await db.query(`
+            SELECT f.id, u.id as user_id, u.username, u.email, u.profile_picture
+            FROM friends f
+            JOIN users u ON f.user_id = u.id
+            WHERE f.friend_id = ? AND f.status = 'pending'
+        `, [req.user.id]);
+
+        res.json({ friends: friends.rows, pending: pending.rows });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/friends/accept', authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.body; 
+        await db.query('UPDATE friends SET status = ? WHERE id = ? AND friend_id = ?', ['accepted', id, req.user.id]);
+        res.json({ message: 'Friend request accepted' });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/friends/:id', authenticateToken, async (req, res) => {
+    try {
+        await db.query('DELETE FROM friends WHERE id = ? AND (user_id = ? OR friend_id = ?)', 
+            [req.params.id, req.user.id, req.user.id]);
+        res.json({ message: 'Friendship removed' });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/users/all', authenticateToken, async (req, res) => {
+    try {
+        const result = await db.query(`
+            SELECT u.id, u.username, u.email, u.profile_picture,
+            (SELECT status FROM friends WHERE (user_id = ? AND friend_id = u.id) OR (user_id = u.id AND friend_id = ?)) as friend_status,
+            (SELECT user_id FROM friends WHERE (user_id = ? AND friend_id = u.id) OR (user_id = u.id AND friend_id = ?)) as request_sender
+            FROM users u WHERE u.id != ?
+        `, [req.user.id, req.user.id, req.user.id, req.user.id, req.user.id]);
+        res.json(result.rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// 1. Upload - Protected & Encrypted
 app.post('/upload', authenticateToken, upload.single('file'), async (req, res) => {
     try {
         const userId = req.user.id;
@@ -297,7 +706,6 @@ app.post('/upload', authenticateToken, upload.single('file'), async (req, res) =
         let originalName = req.file.originalname;
         try { originalName = Buffer.from(req.file.originalname, 'latin1').toString('utf8'); } catch (e) {}
 
-        // Folder Reconstruction (if uploading a folder)
         if (relative_path && relative_path !== 'undefined' && relative_path !== 'null') {
             const parts = relative_path.split('/').slice(0, -1);
             let pId = (folder_id && folder_id !== 'null') ? folder_id : null;
@@ -315,18 +723,20 @@ app.post('/upload', authenticateToken, upload.single('file'), async (req, res) =
             folder_id = pId;
         }
 
-        // 1. Determine final physical path
         const folderPath = await getFolderPathString(folder_id);
         const targetDir = path.join(UPLOAD_DIR, userId, 'active', folderPath);
         if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });
 
-        // 2. Move file from temp to final destination
-        const diskFilename = req.file.filename; // Use the unique filename from multer
+        const diskFilename = req.file.filename;
         const finalRelPath = path.join('cloud', userId, 'active', folderPath, diskFilename).replace(/\\/g, '/');
         const finalAbsPath = path.resolve(finalRelPath);
-        fs.renameSync(req.file.path, finalAbsPath);
 
-        // 3. Save to DB
+        // Encrypt file before saving
+        const fileData = fs.readFileSync(req.file.path);
+        const encryptedData = encryptBuffer(fileData);
+        fs.writeFileSync(finalAbsPath, encryptedData);
+        fs.unlinkSync(req.file.path); // Remove temp file
+
         const fid = uuidv4();
         const target = (folder_id && folder_id !== 'null') ? folder_id : null;
         await db.query('INSERT INTO files (id, user_id, folder_id, name, storage_path, size, mime_type) VALUES (?,?,?,?,?,?,?)', 
@@ -350,28 +760,35 @@ app.get('/list', authenticateToken, async (req, res) => {
         let folders, files;
 
         if (fid) {
-            // Content of a specific folder (owned by user)
-            folders = await db.query('SELECT * FROM folders WHERE user_id=? AND parent_id=? AND is_deleted=?', [userId, fid, trash]);
-            files = await db.query('SELECT * FROM files WHERE user_id=? AND folder_id=? AND is_deleted=?', [userId, fid, trash]);
-        } else if (trash) {
-            // Only user's trash
-            folders = await db.query('SELECT * FROM folders WHERE user_id=? AND is_deleted=TRUE', [userId]);
-            files = await db.query('SELECT * FROM files WHERE user_id=? AND is_deleted=TRUE', [userId]);
-        } else {
-            // Root: Own items + Shared items
-            folders = await db.query(`
-                SELECT * FROM folders WHERE user_id=? AND parent_id IS NULL AND is_deleted=FALSE
+            const access = await db.query(`
+                SELECT id FROM folders WHERE id=? AND user_id=?
                 UNION
-                SELECT f.* FROM folders f 
+                SELECT folder_id FROM permissions WHERE folder_id=? AND user_id=?
+            `, [fid, userId, fid, userId]);
+
+            if (access.rows.length === 0) return res.status(403).json({ error: 'Access denied' });
+
+            folders = await db.query('SELECT *, 0 AS is_shared FROM folders WHERE parent_id=? AND is_deleted=?', [fid, trash]);
+            files = await db.query('SELECT *, 0 AS is_shared FROM files WHERE folder_id=? AND is_deleted=?', [fid, trash]);
+        } else if (trash) {
+            folders = await db.query('SELECT *, 0 AS is_shared FROM folders WHERE user_id=? AND is_deleted=TRUE', [userId]);
+            files = await db.query('SELECT *, 0 AS is_shared FROM files WHERE user_id=? AND is_deleted=TRUE', [userId]);
+        } else {
+            folders = await db.query(`
+                SELECT *, 0 AS is_shared, NULL AS owner_email FROM folders WHERE user_id=? AND parent_id IS NULL AND is_deleted=FALSE
+                UNION
+                SELECT f.*, 1 AS is_shared, u.email AS owner_email FROM folders f 
                 INNER JOIN permissions p ON f.id = p.folder_id 
+                INNER JOIN users u ON f.user_id = u.id
                 WHERE p.user_id=? AND f.is_deleted=FALSE
             `, [userId, userId]);
 
             files = await db.query(`
-                SELECT * FROM files WHERE user_id=? AND folder_id IS NULL AND is_deleted=FALSE
+                SELECT *, 0 AS is_shared, NULL AS owner_email FROM files WHERE user_id=? AND folder_id IS NULL AND is_deleted=FALSE
                 UNION
-                SELECT f.* FROM files f 
+                SELECT f.*, 1 AS is_shared, u.email AS owner_email FROM files f 
                 INNER JOIN permissions p ON f.id = p.file_id 
+                INNER JOIN users u ON f.user_id = u.id
                 WHERE p.user_id=? AND f.is_deleted=FALSE
             `, [userId, userId]);
         }
@@ -460,13 +877,12 @@ app.post('/batch-action', authenticateToken, async (req, res) => {
     } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
-// Extra routes - Protected
 app.get('/stats', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.id;
         const r = await db.query('SELECT SUM(size) as total_size FROM files WHERE user_id=? AND is_deleted=FALSE', [userId]);
         const s = r.rows[0].total_size || 0;
-        res.json({ used_mb: (s / (1024 * 1024)).toFixed(2) });
+        res.json({ used_bytes: s });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -478,8 +894,12 @@ app.get('/files/view/:id', authenticateToken, async (req, res) => {
             WHERE id=? AND (user_id=? OR id IN (SELECT file_id FROM permissions WHERE user_id=?))
         `, [req.params.id, userId, userId]);
         if (!r.rows.length) return res.status(404).send('No access or not found');
+        
+        const encryptedData = fs.readFileSync(path.resolve(r.rows[0].storage_path));
+        const decryptedData = decryptBuffer(encryptedData);
+        
         res.setHeader('Content-Type', r.rows[0].mime_type);
-        res.sendFile(path.resolve(r.rows[0].storage_path));
+        res.send(decryptedData);
     } catch (e) { res.status(500).send(e.message); }
 });
 
@@ -490,8 +910,23 @@ app.get('/files/download/:id', authenticateToken, async (req, res) => {
             SELECT storage_path, name FROM files 
             WHERE id=? AND (user_id=? OR id IN (SELECT file_id FROM permissions WHERE user_id=?))
         `, [req.params.id, userId, userId]);
-        if (r.rows.length) res.download(path.resolve(r.rows[0].storage_path), r.rows[0].name);
-        else res.status(404).send('No access');
+        if (r.rows.length) {
+            const encryptedData = fs.readFileSync(path.resolve(r.rows[0].storage_path));
+            const decryptedData = decryptBuffer(encryptedData);
+            res.setHeader('Content-Disposition', `attachment; filename="${r.rows[0].name}"`);
+            res.send(decryptedData);
+        } else res.status(404).send('No access');
+    } catch (e) { res.status(500).send(e.message); }
+});
+
+app.put('/files/:id', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const { name } = req.body;
+        if (!name) return res.status(400).json({ error: 'Name is required' });
+
+        await db.query('UPDATE files SET name = ? WHERE id = ? AND user_id = ?', [name, req.params.id, userId]);
+        res.json({ ok: true });
     } catch (e) { res.status(500).send(e.message); }
 });
 
@@ -500,7 +935,8 @@ app.put('/files/content/:id', authenticateToken, async (req, res) => {
         const userId = req.user.id;
         const r = await db.query('SELECT storage_path FROM files WHERE id=? AND user_id=?', [req.params.id, userId]);
         if (r.rows.length) {
-            fs.writeFileSync(path.resolve(r.rows[0].storage_path), req.body.content, 'utf8');
+            const encryptedData = encryptBuffer(Buffer.from(req.body.content, 'utf8'));
+            fs.writeFileSync(path.resolve(r.rows[0].storage_path), encryptedData);
             res.json({ ok: true });
         } else res.status(404).send('No access');
     } catch (e) { res.status(500).send(e.message); }
@@ -514,7 +950,6 @@ app.post('/folders', authenticateToken, async (req, res) => {
         await db.query('INSERT INTO folders (id, user_id, parent_id, name, color, icon_type) VALUES (?,?,?,?,?,?)', 
             [id, userId, parent_id || null, name, color || 'blue', icon_type || 'folder']);
         
-        // Physical mkdir
         const folderPath = await getFolderPathString(id);
         const absPath = path.resolve(UPLOAD_DIR, userId, 'active', folderPath);
         if (!fs.existsSync(absPath)) fs.mkdirSync(absPath, { recursive: true });
@@ -528,7 +963,6 @@ app.put('/folders/:id', authenticateToken, async (req, res) => {
         const userId = req.user.id;
         const { name, color, icon_type } = req.body;
         
-        // Physical rename
         const oldFolderPath = await getFolderPathString(req.params.id);
         const oldAbsPath = path.resolve(UPLOAD_DIR, userId, 'active', oldFolderPath);
         
@@ -540,7 +974,6 @@ app.put('/folders/:id', authenticateToken, async (req, res) => {
         
         if (fs.existsSync(oldAbsPath) && oldAbsPath !== newAbsPath) {
             fs.renameSync(oldAbsPath, newAbsPath);
-            // Update all child files paths in DB (recursive update)
             const updateChildPaths = async (parentId) => {
                 const files = await db.query('SELECT id, storage_path FROM files WHERE folder_id = ?', [parentId]);
                 for (const f of files.rows) {
@@ -566,7 +999,11 @@ app.post('/files/create', authenticateToken, async (req, res) => {
         if (!fs.existsSync(activeDir)) fs.mkdirSync(activeDir, { recursive: true });
         const filename = `${Date.now()}-${uuidv4()}.txt`;
         const p = path.join(activeDir, filename);
-        fs.writeFileSync(p, '', 'utf8');
+        
+        // Save encrypted empty file
+        const encryptedData = encryptBuffer(Buffer.from('', 'utf8'));
+        fs.writeFileSync(p, encryptedData);
+        
         const id = uuidv4();
         await db.query('INSERT INTO files (id, user_id, folder_id, name, storage_path, size, mime_type) VALUES (?,?,?,?,?,?,?)', 
             [id, userId, req.body.folder_id || null, req.body.name, `cloud/${userId}/active/${filename}`, 0, 'text/plain']);

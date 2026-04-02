@@ -1,0 +1,17 @@
+{
+    "user_info": {
+        "username": "demo 1",
+        "email": "demo1@example.com",
+        "password_hash": "$2b$10$poDeLa/PR/igqEuG/ibmpuQVo3BXKWixhtLob7g6u73BMP0sOCKHW"
+    },
+    "history": [
+        {
+            "timestamp": "2026-03-27T14:37:10.518Z",
+            "action": "ACCOUNT_CREATED",
+            "details": {
+                "username": "demo 1",
+                "email": "demo1@example.com"
+            }
+        }
+    ]
+}

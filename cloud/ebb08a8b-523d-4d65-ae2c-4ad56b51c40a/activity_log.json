@@ -1,0 +1,43 @@
+{
+    "user_info": {
+        "username": "demo 0",
+        "email": "demo@example.com",
+        "password_hash": "$2b$10$bB8F/zZc5S8JDH/TB1Pcq.7j0eJZnQcxE/BBTjX3ND6OHV7cth8YC"
+    },
+    "history": [
+        {
+            "timestamp": "2026-03-27T13:38:16.878Z",
+            "action": "ACCOUNT_CREATED",
+            "details": {
+                "username": "demo 0",
+                "email": "demo@example.com"
+            }
+        },
+        {
+            "timestamp": "2026-03-27T15:01:43.590Z",
+            "action": "UPLOAD",
+            "details": {
+                "file_name": "656287632_956646800087847_3588310787522453967_n.jpg",
+                "size": 260344
+            }
+        },
+        {
+            "timestamp": "2026-03-27T15:01:53.829Z",
+            "action": "TRASH",
+            "details": {
+                "items": [
+                    "656287632_956646800087847_3588310787522453967_n.jpg"
+                ]
+            }
+        },
+        {
+            "timestamp": "2026-03-27T15:01:57.141Z",
+            "action": "PERMANENT_DELETE",
+            "details": {
+                "items": [
+                    "656287632_956646800087847_3588310787522453967_n.jpg"
+                ]
+            }
+        }
+    ]
+}
